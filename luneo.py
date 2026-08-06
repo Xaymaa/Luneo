@@ -5,6 +5,8 @@ import os
 import json
 import base64
 import secrets
+import re
+import hmac
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization,hashes
 from cryptography.exceptions import InvalidSignature
@@ -25,6 +27,12 @@ log.info("Server launched successfully !")
 s_listen.listen()
 
 connected_clients={}
+clients_lock = threading.Lock()
+
+VALID_USERNAME = re.compile(r"^[a-z0-9_-]{2,32}$")
+
+def valid_username(name):
+    return isinstance(name, str) and bool(VALID_USERNAME.match(name))
 
 def send_msg(msg_code,client_connection,*,username="",recipient="",pending_author="",msg="",code=0,isRegistered="",pubkey=""):
   if msg_code==20:
@@ -43,7 +51,7 @@ def send_msg(msg_code,client_connection,*,username="",recipient="",pending_autho
       "pending messages":{}
     }
     for message in pending_messages:
-      author=message.split("_")[1][:-5]
+      author=message.removeprefix("pending_").removesuffix(".json")
       with open(f"user_data/{username}/pending/{message}","rb") as msg:
         message_count=len(json.loads(msg.read()))
       formatted_msg["pending messages"][author]=message_count
@@ -81,14 +89,15 @@ def send_msg(msg_code,client_connection,*,username="",recipient="",pending_autho
     }
   send_framed(client_connection,formatted_msg)
 
-def deliver_pending_messages(client_connection,username,pending_author):
-    pending_dir=f"user_data/{username}/pending"
-    if os.path.isfile(f"{pending_dir}/pending_{pending_author}.json"):
-      log.info(f"delivering the pending messages of user : {username}")
-      with open(f"{pending_dir}/pending_{pending_author}.json","r") as m:
-        message=json.dumps(m.read())
-        send_msg(22,client_connection,msg=message,pending_author=pending_author)
-      os.remove(f"{pending_dir}/pending_{pending_author}.json")
+def deliver_pending_messages(client_connection, username, pending_author):
+    pending_dir = f"user_data/{username}/pending"
+    path = f"{pending_dir}/pending_{pending_author}.json"
+    if os.path.isfile(path):
+        log.info(f"delivering the pending messages of user : {username}")
+        with open(path, "r") as m:
+            message = json.load(m)
+        send_msg(22, client_connection, msg=message, pending_author=pending_author)
+        os.remove(path)
 
 def authenticate(client_connection,username,isRegistered,pubkey):
   if isRegistered==False:
@@ -117,21 +126,19 @@ def authenticate(client_connection,username,isRegistered,pubkey):
               label=None))
       ciphertext_challenge=base64.b64encode(ciphertext_challenge).decode("ascii")
       send_msg(25,client_connection,username=username,msg=ciphertext_challenge)
-      while True:
-        data = recv_framed(client_connection)
-        if data:
-          challenge_response=handle_messages(client_connection,data)
-          if challenge_phrase==challenge_response:
-            send_msg(23,client_connection,username=username)
-            return True,username
-          else :
-            send_msg(24,client_connection,username=username,code=2,msg="")
-            return False,username
-        if data is None: 
-          return False, username
+      data = recv_framed(client_connection)
+      if data is None: 
+        return False, username
+      challenge_response=parse_challenge_response(data,username)
+      if challenge_response and hmac.compare_digest(challenge_phrase, challenge_response):
+        send_msg(23,client_connection,username=username)
+        return True,username
+      else :
+        send_msg(24,client_connection,username=username,code=2,msg="")
+        return False,username
     else:
       send_msg(24,client_connection,username=username,isRegistered=isRegistered,code=1,msg=f"The user {username} does not exist.")
-      return False,""
+      return False,username
 
 def verify_signature(payload,username,*,recipient=""):
   with open(f"user_data/{username}/{username}.pub", "rb") as key_file:
@@ -140,7 +147,7 @@ def verify_signature(payload,username,*,recipient=""):
           )
   try:  
     signature=base64.b64decode(payload["signature"])
-  except:
+  except Exception:
     return False
   payload=payload.copy()
   del payload["signature"]
@@ -157,87 +164,118 @@ def verify_signature(payload,username,*,recipient=""):
     )
     return True
   except InvalidSignature:
-    print("Invalid Signature.")
+    log.error(f"Invalid Signature from user {username}")
     return False
 
-def handle_messages(client_connection, data):
-  msg_code=data["type"]["code"]
-  username=data["username"]
-  if msg_code==12:
-    username=data["username"].lower()
-    isRegistered=data["isRegistered"]
-    pubkey=data["pubkey"]
-    authenticated=authenticate(client_connection,username,isRegistered,pubkey)
-    return authenticated
-  if verify_signature(data,username):
-    log.info(f"Signature verified successfully from user : {username}")
-    if msg_code==10:
-      recipient=data["recipient"]
-      log.info(f"Received message type {msg_code} from {username} to {recipient}")
-      if not os.path.isdir(f"user_data/{recipient}"):
-        send_msg(20,client_connection,msg=f"The user {recipient} does not exist")
-      else:
-        if recipient not in connected_clients :
+def handle_messages(client_connection, data, session_username):
+  msg_code = data["type"]["code"]
+  if data.get("username") != session_username:
+      log.warning(f"{session_username} claimed author {data.get('username')}")
+      return
+  if not verify_signature(data, session_username):
+      log.info(f"Invalid signature from {session_username}")
+      raise ValueError("bad signature")
+  if not valid_username(data["username"]):
+    send_msg(20, client_connection, code=2, msg="Invalid username.")
+    return
+  username=session_username
+  if msg_code==10:
+    if not valid_username(data["recipient"]):
+      send_msg(20, client_connection, code=2, msg="Invalid username.")
+      return
+    recipient=data["recipient"]
+    log.info(f"Received message type {msg_code} from {username} to {recipient}")
+    if not os.path.isdir(f"user_data/{recipient}"):
+      send_msg(20,client_connection,msg=f"The user {recipient} does not exist")
+    else:
+      with clients_lock:
+        recipient_conn = connected_clients.get(recipient)
+      if recipient_conn is None:
           if not os.path.isdir(f"user_data/{recipient}/pending"):
-            os.makedirs(f"user_data/{recipient}/pending")
-          if os.path.isfile(f"user_data/{recipient}/pending/pending_{username}.json"):
-            with open (f"user_data/{recipient}/pending/pending_{username}.json","rb") as pending_msg:
-              pending=json.loads(pending_msg.read())
-              pending[len(pending)]=data
-            with open (f"user_data/{recipient}/pending/pending_{username}.json","w") as pending_msg:
-              pending_msg.write(f"{json.dumps(pending)}")
+              os.makedirs(f"user_data/{recipient}/pending")
+          pending_path = f"user_data/{recipient}/pending/pending_{username}.json"
+          if os.path.isfile(pending_path):
+              with open(pending_path, "rb") as pending_msg:
+                  pending = json.loads(pending_msg.read())
+              pending[len(pending)] = data
           else:
-            with open (f"user_data/{recipient}/pending/pending_{username}.json","w") as pending_msg:
-              pending={}
-              pending[0]=data
-              pending_msg.write(f"{json.dumps(pending)}")
-          send_msg(20,client_connection,code=1,msg=f"{recipient} is not currently online, your message will reach them once he logs back on.")
-        else:
-          send_framed(connected_clients[recipient], data) 
-    elif msg_code==11:
-      username=data["username"]
-      pending_author=data["pending_author"]
-      deliver_pending_messages(client_connection,username,pending_author)
-    elif msg_code==13:
-      challenge_response=base64.b64decode(data["challenge_phrase"])
-      return challenge_response
-    elif msg_code==14:
-      username=data['username']
-      recipient=data['recipient']
-      try:
-        with open(f"user_data/{recipient}/{recipient}.pub", "rb") as key_file:
-            pubkey = serialization.load_pem_public_key(
-                key_file.read()
-            )
-            pubkey=pubkey.public_bytes(encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo)
-            send_msg(26,client_connection,username=username,recipient=recipient,pubkey=pubkey)
-      except FileNotFoundError:
-        send_msg(20,client_connection,msg=f"The user {recipient} does not exist.")
+              pending = {0: data}
+          with open(pending_path, "w") as pending_msg:
+              pending_msg.write(json.dumps(pending))
+          send_msg(20, client_connection, code=1,msg=f"{recipient} is not currently online, your message will reach them once he logs back on.")  
+      else:
+          send_framed(recipient_conn, data) 
+  elif msg_code==11:
+    pending_author=data["pending_author"]
+    deliver_pending_messages(client_connection,username,pending_author)
+  elif msg_code==14:
+    if not valid_username(data["recipient"]):
+      send_msg(20, client_connection, code=2, msg="Invalid username.")
+      return
+    recipient=data['recipient']
+    try:
+      with open(f"user_data/{recipient}/{recipient}.pub", "rb") as key_file:
+          pubkey = serialization.load_pem_public_key(
+              key_file.read()
+          )
+          pubkey=pubkey.public_bytes(encoding=serialization.Encoding.PEM,
+          format=serialization.PublicFormat.SubjectPublicKeyInfo)
+          send_msg(26,client_connection,username=username,recipient=recipient,pubkey=pubkey)
+    except FileNotFoundError:
+      send_msg(20,client_connection,msg=f"The user {recipient} does not exist.")
   else:
-    log.info(f"Invalid Signature from user : {username}")
+    log.warning(f"Unknown code sent from user : {username}")
     client_connection.close()
 
-    
+def parse_challenge_response(data, session_username):
+  msg_code = data["type"]["code"]
+  if msg_code==13:
+    if data.get("username") != session_username:
+        log.warning(f"{session_username} claimed author {data.get('username')}")
+        return
+    if not verify_signature(data, session_username):
+        log.info(f"Invalid signature from {session_username}")
+        raise ValueError("bad signature")
+    challenge_response=base64.b64decode(data["challenge_phrase"])
+    return challenge_response
+  else:
+     return ""
 
 def handle_client(client_connection):
-  authenticated=False
-  while not authenticated:
-    data = recv_framed(client_connection)
-    if data:
-      authenticated,username=handle_messages(client_connection,data)
-      if authenticated==False:client_connection.close()
-      break
-    if data is None: 
-      return
-  connected_clients[username]=client_connection
-  send_msg(21,client_connection,username=username)
-  while authenticated:
-    data = recv_framed(client_connection)
-    if not data:
-      del connected_clients[username]
-      break
-    handle_messages(client_connection, data)
+    username = None
+    try:
+        #Authentication
+        data = recv_framed(client_connection)
+        if data is None:
+            return
+        if data["type"]["code"] != 12:
+            send_msg(20, client_connection, code=2, msg="Authentication required.")
+            return
+        if not valid_username(data["username"]):
+          send_msg(20, client_connection, code=3, msg="Invalid username.")
+          return
+        ok, username = authenticate(client_connection, data["username"],data["isRegistered"],data["pubkey"])
+        if not ok:
+            return
+        with clients_lock:
+            connected_clients[username] = client_connection
+        send_msg(21, client_connection, username=username)
+        #Normal traffic after auth
+        while True:
+            data = recv_framed(client_connection)
+            if data is None:
+                break
+            handle_messages(client_connection, data, username)
+    except (ConnectionResetError, ConnectionAbortedError, OSError) as e:
+        log.info(f"connection dropped: {e!r}")
+    except Exception as e:
+        log.error(f"error for {username}: {e!r}")
+    finally:
+        if username:
+            with clients_lock:
+                if connected_clients.get(username) is client_connection:
+                    del connected_clients[username]
+        client_connection.close()
     
 
 while True:

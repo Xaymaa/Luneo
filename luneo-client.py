@@ -7,7 +7,7 @@ import base64
 import shutil
 import sys
 import secrets
-import time
+import re
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import rsa,padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -23,6 +23,26 @@ s_connect = s.socket(s.AF_INET, s.SOCK_STREAM)
 #hostname="87.106.192.17"
 hostname="0.0.0.0"
 host_port=9941
+
+authentication_try=threading.Event()
+authenticated=False
+
+contact_selection=threading.Event()
+contact_selected=True
+
+connection_lost=threading.Event()
+
+auth_failed_reason = None
+awaiting_contact = None
+username = None
+
+pending_verification = {}
+
+VALID_USERNAME = re.compile(r"^[a-z0-9_-]{2,32}$")
+
+def valid_username(name):
+    return isinstance(name, str) and bool(VALID_USERNAME.match(name))
+
 
 def generate_keys(username):
   user_dir=f"{home}/.luneo/{username}"
@@ -45,7 +65,7 @@ def generate_keys(username):
   return private_key,pubkey
 
 def encrypt(plaintext,username,recipient):
-  plain_key=secrets.token_bytes(16)
+  plain_key=secrets.token_bytes(32)
   iv=secrets.token_bytes(12)
   encryptor=Cipher(algorithms.AES(plain_key),modes.GCM(iv),).encryptor()
   ciphertext=encryptor.update(plaintext.encode("utf-8")) + encryptor.finalize() 
@@ -113,7 +133,7 @@ def verify_signature(payload,username,*,recipient=""):
           )
   try:  
     signature=base64.b64decode(payload["signature"])
-  except:
+  except Exception:
     return False
   payload=payload.copy()
   del payload["signature"]
@@ -174,102 +194,128 @@ def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",i
     payload=json.dumps(formatted_msg).encode("utf-8")
     send_framed(connection, sign(payload, username))
 
-authentication_try=threading.Event()
-authenticated=False
-
-contact_selection=threading.Event()
-contact_selected=True
-
-pending_verification = {}
 
 def handle_messages(connection):
   global authenticated
   global contact_selected
+  global auth_failed_reason
+  global awaiting_contact
   while True:
     data = recv_framed(connection)
-    if not data:
-      print("connection closed.")
-      sys.exit(1)
-      break
-    msg_code=data["type"]["code"]
-    if msg_code==10:
-      username=data["username"]
-      recipient=data["recipient"]
-      keypath = f"{home}/.luneo/{recipient}/contacts/{username}.pub"
-      if not os.path.isfile(keypath):
-          pending_verification.setdefault(username, []).append(data)
-          send_msg(14, connection, username=recipient, recipient=username)
-          continue 
-      if verify_signature(data,username,recipient=recipient):
-        message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"])
-        print(f"{username} : {message}")
-    elif msg_code==20:   
-      print(f"received from server : {data["message"]}")
-      if data["info_code"]==0:
-        contact_selected=False
-        contact_selection.set()
-    elif msg_code==21:
-      if data["pending messages"]=={}:
-        print("You have no new messages")
-      else:
-        print(f"You have new message(s) : {data["pending messages"]}")
-    elif msg_code==22:
-      pendings=json.loads(json.loads(data["pending messages"]))
-      print("New messages :")
-      for index in pendings:
-        if verify_signature(pendings[index],pendings[index]["username"],recipient=pendings[index]["recipient"]):
-          message=decrypt(pendings[index]["iv"],pendings[index]["ciphertext"],pendings[index]["key"],pendings[index]["tag"],pendings[index]["recipient"])
-          print(f"{pendings[index]["username"]} : {message}")
-    elif msg_code==23:
-      print(f"Authentication Successful")
-      authenticated=True
+    if data is None: 
+      connection_lost.set()
       authentication_try.set()
-    elif msg_code==24:
-      print(f"Failed Authentication : {data["message"]}")
-      authenticated=False
-      if data["failure_code"]==0:
-        shutil.rmtree(f"{home}/.luneo/{data["username"]}")
-        authentication_try.set()
-        break
-      authentication_try.set()
-    elif msg_code==25:
-      username=data["username"]
-      ciphertext=base64.b64decode(data["challenge_phrase"])
-      try:
-        with open(f"{home}/.luneo/{username}/{username}.key", "rb") as key_file:
-          privkey = serialization.load_pem_private_key(
-          key_file.read(),
-          password=None,
-          ) 
-      except:
-        print(f"You have no key for user {username}")
-        s_connect.close()
-        sys.exit(1)
-      try :
-        plaintext = privkey.decrypt(
-        ciphertext,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None))
-      except : 
-        print("Public Key Error : Decryption Failed.")
-        connection.close()
-        sys.exit(1)
-      plaintext=base64.b64encode(plaintext).decode("ascii")
-      send_msg(13,connection,username=username,msg=plaintext)
-    elif msg_code==26:
-      username=data["username"]
-      recipient=data["recipient"]
-      pubkey=data["pubkey"]
-      if not os.path.isdir(f"{home}/.luneo/{username}/contacts"):
-        os.makedirs(f"{home}/.luneo/{username}/contacts")
-      with open(f"{home}/.luneo/{username}/contacts/{recipient}.pub", "wb") as pub_file:
-          pub_file.write(pubkey.encode("utf-8"))
-      for held in pending_verification.pop(recipient, []):
-        if verify_signature(held, held["username"], recipient=held["recipient"]):
-            print(f"{held['username']} : {decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"])}")
       contact_selection.set()
+      return
+    try:
+      msg_code=data["type"]["code"]
+      if msg_code==10:
+        if not valid_username(data["username"]):
+          print("Invalid username received from server.")
+          continue
+        sender=data["username"]
+        recipient=data["recipient"]
+        keypath = f"{home}/.luneo/{recipient}/contacts/{sender}.pub"
+        if not os.path.isfile(keypath):
+            pending_verification.setdefault(sender, []).append(data)
+            send_msg(14, connection, username=recipient, recipient=sender)
+            continue 
+        if verify_signature(data,sender,recipient=recipient):
+          message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"])
+          print(f"{sender} : {message}")
+      elif msg_code==20:   
+        print(f"received from server : {data["message"]}")
+        if data["info_code"]==0:
+          contact_selected=False
+          contact_selection.set()
+      elif msg_code==21:
+        if data["pending messages"]=={}:
+          print("You have no new messages")
+        else:
+          print(f"You have new message(s) : {data["pending messages"]}")
+      elif msg_code==22:
+        pendings=data["pending messages"]
+        print("New messages :")
+        for index in pendings:
+          if verify_signature(pendings[index],pendings[index]["username"],recipient=pendings[index]["recipient"]):
+            message=decrypt(pendings[index]["iv"],pendings[index]["ciphertext"],pendings[index]["key"],pendings[index]["tag"],pendings[index]["recipient"])
+            print(f"{pendings[index]["username"]} : {message}")
+      elif msg_code==23:
+        print(f"Authentication Successful")
+        authenticated=True
+        authentication_try.set()
+      elif msg_code == 24:
+        if username is None: 
+          auth_failed_reason = data.get("message", "unknown")
+          authenticated = False
+          authentication_try.set()
+          return
+        if not valid_username(data["username"]):
+          print("Invalid username received from server.")
+          return
+        if data["username"] != username:
+          print("Server tried to delete keys for a different account.")
+          return
+        auth_failed_reason = data["message"]
+        authenticated = False
+        if data["failure_code"] == 0:
+            shutil.rmtree(f"{home}/.luneo/{data['username']}")
+        authentication_try.set()
+        return
+      elif msg_code==25:
+        if not valid_username(data["username"]):
+          print("Invalid username received from server.")
+          continue
+        challengee=data["username"]
+        ciphertext=base64.b64decode(data["challenge_phrase"])
+        try:
+          with open(f"{home}/.luneo/{challengee}/{challengee}.key", "rb") as key_file:
+            privkey = serialization.load_pem_private_key(
+            key_file.read(),
+            password=None,
+            ) 
+        except FileNotFoundError:
+          print(f"You have no key for user {challengee}")
+          connection_lost.set()
+          authentication_try.set()
+          contact_selection.set()
+          return
+        try :
+          plaintext = privkey.decrypt(
+          ciphertext,
+          padding.OAEP(
+              mgf=padding.MGF1(algorithm=hashes.SHA256()),
+              algorithm=hashes.SHA256(),
+              label=None))
+        except Exception as e:
+          print(f"Decryption failed: {e!r}")
+          connection_lost.set()
+          authentication_try.set()
+          contact_selection.set()
+          return
+        plaintext=base64.b64encode(plaintext).decode("ascii")
+        send_msg(13,connection,username=challengee,msg=plaintext)
+      elif msg_code==26:
+        if not valid_username(data["username"]):
+          print("Invalid username received from server.")
+          continue
+        if not valid_username(data["recipient"]):
+          print("Invalid recipient received from server.")
+          continue
+        key_owner=data["username"]
+        recipient=data["recipient"]
+        pubkey=data["pubkey"]
+        if not os.path.isdir(f"{home}/.luneo/{key_owner}/contacts"):
+          os.makedirs(f"{home}/.luneo/{key_owner}/contacts")
+        with open(f"{home}/.luneo/{key_owner}/contacts/{recipient}.pub", "wb") as pub_file:
+            pub_file.write(pubkey.encode("utf-8"))
+        for held in pending_verification.pop(recipient, []):
+          if verify_signature(held, held["username"], recipient=held["recipient"]):
+              print(f"{held['username']} : {decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"])}")
+        if awaiting_contact==recipient:
+          contact_selection.set()
+    except Exception as e:
+      print(f"error handling message: {e!r}")
       
 
 
@@ -309,7 +355,7 @@ else:
       pubkey = serialization.load_pem_public_key(
           key_file.read()
       )
-  except:
+  except FileNotFoundError:
     print(f"You have no data for user {username}")
     s_connect.close()
     sys.exit(1)
@@ -318,19 +364,27 @@ else:
   send_msg(12,s_connect,username=username,pubkey=pubkey,isRegistered=True)
 
 authentication_try.wait()
+if connection_lost.is_set():
+    print("Lost connection to server.")
+    sys.exit(1)
+
 if not authenticated:
-  sys.exit(1)
+    print(f"Authentication failed: {auth_failed_reason}")
+    s_connect.close()
+    sys.exit(1)
 
 with patch_stdout():
-  while True :
+  while not connection_lost.is_set() :
     recipient=prompt("choose contact: ")
     if recipient == "":
-      log.info("Not a valid contact")
       continue
     contact_selected=True
     contact_selection.clear()
+    awaiting_contact=recipient
     send_msg(14,s_connect,username=username,recipient=recipient)
-    contact_selection.wait()
+    if not contact_selection.wait(10):
+      print("Server did not respond, try again.")
+      continue
     if contact_selected:
       log.info("send '/c' to change contact")
       send_msg(11,s_connect,username=username, recipient=recipient)
