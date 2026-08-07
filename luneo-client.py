@@ -8,6 +8,7 @@ import shutil
 import sys
 import secrets
 import re
+import uuid
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import rsa,padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -17,7 +18,7 @@ from prompt_toolkit import prompt
 from prompt_toolkit.patch_stdout import patch_stdout
 from protocol import send_framed,recv_framed
 
-home = Path.home()
+HOME = Path.home()
 log.basicConfig(level=log.INFO, format='[%(levelname)s] | %(asctime)s | %(message)s')
 s_connect = s.socket(s.AF_INET, s.SOCK_STREAM)
 #hostname="87.106.192.17"
@@ -38,6 +39,8 @@ username = None
 
 pending_verification = {}
 
+
+
 VALID_USERNAME = re.compile(r"^[a-z0-9_-]{2,32}$")
 
 def valid_username(name):
@@ -45,7 +48,7 @@ def valid_username(name):
 
 
 def generate_keys(username):
-  user_dir=f"{home}/.luneo/{username}"
+  user_dir=f"{HOME}/.luneo/{username}"
   os.makedirs(user_dir)
   private_key = rsa.generate_private_key(
     public_exponent=65537,
@@ -69,7 +72,7 @@ def encrypt(plaintext,username,recipient):
   iv=secrets.token_bytes(12)
   encryptor=Cipher(algorithms.AES(plain_key),modes.GCM(iv),).encryptor()
   ciphertext=encryptor.update(plaintext.encode("utf-8")) + encryptor.finalize() 
-  with open(f"{home}/.luneo/{username}/contacts/{recipient}.pub", "rb") as key_file:
+  with open(f"{HOME}/.luneo/{username}/contacts/{recipient}.pub", "rb") as key_file:
           pubkey = serialization.load_pem_public_key(
               key_file.read()
           )
@@ -90,7 +93,7 @@ def decrypt(iv,ciphertext,encrypted_key,tag,username):
   ciphertext=base64.b64decode(ciphertext)
   encrypted_key=base64.b64decode(encrypted_key)
   tag=base64.b64decode(tag)
-  with open(f"{home}/.luneo/{username}/{username}.key", "rb") as key_file:
+  with open(f"{HOME}/.luneo/{username}/{username}.key", "rb") as key_file:
     privkey = serialization.load_pem_private_key(
     key_file.read(),
     password=None,
@@ -108,7 +111,7 @@ def decrypt(iv,ciphertext,encrypted_key,tag,username):
   return (decryptor.update(ciphertext) + decryptor.finalize()).decode("utf-8")
   
 def sign(payload,username):
-  with open(f"{home}/.luneo/{username}/{username}.key", "rb") as key_file:
+  with open(f"{HOME}/.luneo/{username}/{username}.key", "rb") as key_file:
     privkey = serialization.load_pem_private_key(
     key_file.read(),
     password=None,
@@ -127,7 +130,7 @@ def sign(payload,username):
   return decoded_payload
 
 def verify_signature(payload,username,*,recipient=""):
-  with open(f"{home}/.luneo/{recipient}/contacts/{username}.pub", "rb") as key_file:
+  with open(f"{HOME}/.luneo/{recipient}/contacts/{username}.pub", "rb") as key_file:
           pubkey = serialization.load_pem_public_key(
               key_file.read()
           )
@@ -154,6 +157,24 @@ def verify_signature(payload,username,*,recipient=""):
     return False
 
 
+def is_uuid_unique(uid,username):
+  try:
+    with open(f"{HOME}/.luneo/{username}/known_ids.txt","r") as u:
+      ids=u.read().split()
+    if uid not in ids:
+      return True
+    else:
+      return False
+  except FileNotFoundError:
+    return True
+
+def record_uuid(uid,username):
+  try:
+    with open(f"{HOME}/.luneo/{username}/known_ids.txt","a") as u:
+      u.write(uid+"\n")
+  except Exception as e:
+    print(f"{e!r}")
+
 def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",isRegistered=""):
     if msg_code==10:
       iv,ciphertext,encrypted_key,tag=encrypt(msg,username,recipient)
@@ -164,7 +185,8 @@ def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",i
         "ciphertext":ciphertext,
         "iv":iv,
         "key":encrypted_key,
-        "tag":tag
+        "tag":tag,
+        "id":uuid.uuid4().hex
       }
     elif msg_code==11:
       formatted_msg={
@@ -213,9 +235,14 @@ def handle_messages(connection):
         if not valid_username(data["username"]):
           print("Invalid username received from server.")
           continue
+        if not valid_username(data["recipient"]):
+          print("Invalid username received from server.")
+          continue
         sender=data["username"]
         recipient=data["recipient"]
-        keypath = f"{home}/.luneo/{recipient}/contacts/{sender}.pub"
+        if not is_uuid_unique(data["id"],recipient):
+          continue
+        keypath = f"{HOME}/.luneo/{recipient}/contacts/{sender}.pub"
         if not os.path.isfile(keypath):
             pending_verification.setdefault(sender, []).append(data)
             send_msg(14, connection, username=recipient, recipient=sender)
@@ -223,6 +250,7 @@ def handle_messages(connection):
         if verify_signature(data,sender,recipient=recipient):
           message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"])
           print(f"{sender} : {message}")
+          record_uuid(data["id"],recipient)
       elif msg_code==20:   
         print(f"received from server : {data["message"]}")
         if data["info_code"]==0:
@@ -237,9 +265,16 @@ def handle_messages(connection):
         pendings=data["pending messages"]
         print("New messages :")
         for index in pendings:
-          if verify_signature(pendings[index],pendings[index]["username"],recipient=pendings[index]["recipient"]):
-            message=decrypt(pendings[index]["iv"],pendings[index]["ciphertext"],pendings[index]["key"],pendings[index]["tag"],pendings[index]["recipient"])
-            print(f"{pendings[index]["username"]} : {message}")
+          pending_msg=pendings[index]
+          if not valid_username(pending_msg["recipient"]):
+            print("Invalid recipient received from server.")
+            continue
+          if not is_uuid_unique(pending_msg["id"],pending_msg["recipient"]):
+            continue
+          if verify_signature(pending_msg,pending_msg["username"],recipient=pending_msg["recipient"]):
+            message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"],pending_msg["recipient"])
+            print(f"{pending_msg["username"]} : {message}")
+            record_uuid(pending_msg["id"], pending_msg["recipient"])
       elif msg_code==23:
         print(f"Authentication Successful")
         authenticated=True
@@ -259,7 +294,7 @@ def handle_messages(connection):
         auth_failed_reason = data["message"]
         authenticated = False
         if data["failure_code"] == 0:
-            shutil.rmtree(f"{home}/.luneo/{data['username']}")
+            shutil.rmtree(f"{HOME}/.luneo/{data['username']}")
         authentication_try.set()
         return
       elif msg_code==25:
@@ -269,7 +304,7 @@ def handle_messages(connection):
         challengee=data["username"]
         ciphertext=base64.b64decode(data["challenge_phrase"])
         try:
-          with open(f"{home}/.luneo/{challengee}/{challengee}.key", "rb") as key_file:
+          with open(f"{HOME}/.luneo/{challengee}/{challengee}.key", "rb") as key_file:
             privkey = serialization.load_pem_private_key(
             key_file.read(),
             password=None,
@@ -305,13 +340,16 @@ def handle_messages(connection):
         key_owner=data["username"]
         recipient=data["recipient"]
         pubkey=data["pubkey"]
-        if not os.path.isdir(f"{home}/.luneo/{key_owner}/contacts"):
-          os.makedirs(f"{home}/.luneo/{key_owner}/contacts")
-        with open(f"{home}/.luneo/{key_owner}/contacts/{recipient}.pub", "wb") as pub_file:
+        if not os.path.isdir(f"{HOME}/.luneo/{key_owner}/contacts"):
+          os.makedirs(f"{HOME}/.luneo/{key_owner}/contacts")
+        with open(f"{HOME}/.luneo/{key_owner}/contacts/{recipient}.pub", "wb") as pub_file:
             pub_file.write(pubkey.encode("utf-8"))
         for held in pending_verification.pop(recipient, []):
+          if not is_uuid_unique(held["id"],held["recipient"]):
+            continue
           if verify_signature(held, held["username"], recipient=held["recipient"]):
               print(f"{held['username']} : {decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"])}")
+              record_uuid(held["id"],held["recipient"])
         if awaiting_contact==recipient:
           contact_selection.set()
     except Exception as e:
@@ -320,8 +358,8 @@ def handle_messages(connection):
 
 
 
-if not os.path.isdir(f"{home}/.luneo"):
-  os.makedirs(f"{home}/.luneo")
+if not os.path.isdir(f"{HOME}/.luneo"):
+  os.makedirs(f"{HOME}/.luneo")
 
 s_connect.connect((hostname,host_port))
 log.info(f"connected to server {hostname} on port {host_port}")
@@ -340,7 +378,7 @@ while True:
   username=prompt("username : ").lower()
   if username=="":
     continue
-  user_dir=f"{home}/.luneo/{username}"
+  user_dir=f"{HOME}/.luneo/{username}"
   if isRegistered==False and os.path.isdir(user_dir):
     print("You already have data for this user, you will log in instead.")
     isRegistered=True
