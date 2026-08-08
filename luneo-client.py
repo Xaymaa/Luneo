@@ -462,6 +462,7 @@ if not authenticated:
     sys.exit(1)
 
 with patch_stdout():
+  print("Type /q to quit.")
   while not connection_lost.is_set() :
     in_conversation=""
     send_msg(15, s_connect, username)
@@ -469,6 +470,8 @@ with patch_stdout():
     recipient=prompt("choose contact: ")
     if recipient == "":
       continue
+    elif recipient == "/q":
+      sys.exit(1)
     contact_selected=True
     contact_selection.clear()
     awaiting_contact=recipient
@@ -478,7 +481,7 @@ with patch_stdout():
       continue
     if contact_selected:
       in_conversation=recipient
-      log.info("send '/c' to change contact")
+      log.info("Send '/c' to change contact")
       print_pending_messages(username,recipient)
       while True:
         msg=prompt(">")
@@ -487,4 +490,6 @@ with patch_stdout():
           continue
         elif msg=="/c":
           break
+        elif msg=="/q":
+          sys.exit(1)
         send_msg(10,s_connect,username=username,recipient=recipient,msg=msg)
