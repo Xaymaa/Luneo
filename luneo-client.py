@@ -9,6 +9,8 @@ import sys
 import secrets
 import re
 import uuid
+import argparse
+import ssl
 from pathlib import Path
 from cryptography.hazmat.primitives.asymmetric import rsa,padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -22,10 +24,16 @@ HOME = Path.home()
 LUNEO_DIR = HOME / ".luneo"
 MAX_FILE_SIZE=100*1024*1024
 
+parser = argparse.ArgumentParser()
+parser.add_argument("--tls", action="store_true",help="Enable TLS (default: off)")
+parser.add_argument("--host", default="127.0.0.1")
+parser.add_argument("--port", type=int, default=9941)
+parser.add_argument("--cert", default=None, help="Path to CA cert (for self-signed)")
+args = parser.parse_args()
+
 log.basicConfig(level=log.INFO, format='[%(levelname)s] | %(asctime)s | %(message)s')
-s_connect = s.socket(s.AF_INET, s.SOCK_STREAM)
-hostname="0.0.0.0"
-host_port=9941
+hostname=args.host
+port=args.port
 
 authentication_try=threading.Event()
 authenticated=False
@@ -495,8 +503,30 @@ def handle_messages(connection):
 if not os.path.isdir(f"{LUNEO_DIR}"):
   os.makedirs(f"{LUNEO_DIR}")
 
-s_connect.connect((hostname,host_port))
-log.info(f"connected to server {hostname} on port {host_port}")
+raw_sock = s.socket(s.AF_INET, s.SOCK_STREAM)
+
+if args.tls:
+    if args.cert:                       # self-signed: pin it
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        context.load_verify_locations(args.cert)
+        context.check_hostname = False
+        s_connect = context.wrap_socket(raw_sock)
+    else:                               # CA-signed (Let's Encrypt)
+        context = ssl.create_default_context()
+        s_connect = context.wrap_socket(raw_sock, server_hostname=hostname)
+else:
+    s_connect = raw_sock
+
+try:
+    s_connect.connect((args.host, args.port))
+except ssl.SSLCertVerificationError as e:
+    print(f"Certificate verification failed: {e}")
+    sys.exit(1)
+except ConnectionRefusedError:
+    print(f"Could not connect to {hostname}:{port}")
+    sys.exit(1)
+
+log.info(f"connected to server {hostname} on port {port}")
 threading.Thread(target=handle_messages, args=(s_connect,),daemon=True).start()
 
 while True:

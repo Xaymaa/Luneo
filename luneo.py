@@ -7,12 +7,28 @@ import base64
 import secrets
 import re
 import hmac
+import argparse
+import ssl
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization,hashes
 from cryptography.exceptions import InvalidSignature
 from protocol import send_framed,recv_framed
 
 log.basicConfig(level=log.INFO, format='[%(levelname)s] | %(asctime)s | %(message)s')
+
+parser = argparse.ArgumentParser(description="Luneo server")
+parser.add_argument("--tls", action="store_true",help="Enable TLS (default: off)")
+parser.add_argument("--cert", default=None, help="Path to certificate (fullchain.pem)")
+parser.add_argument("--key", default=None, help="Path to private key (privkey.pem)")
+args = parser.parse_args()
+
+tls_context = None
+if args.tls:
+    tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls_context.load_cert_chain(certfile=args.cert, keyfile=args.key)
+    log.info("TLS enabled")
+else:
+    log.warning("TLS disabled — traffic is unencrypted")
 
 if not os.path.isdir('user_data'):
   os.makedirs("user_data")
@@ -283,5 +299,14 @@ def handle_client(client_connection):
     
 
 while True:
-  client_connection, client_addr = s_listen.accept()
-  threading.Thread(target=handle_client, args=(client_connection,), daemon=True).start()
+    raw_conn, client_addr = s_listen.accept()
+    if tls_context:
+        try:
+            client_connection = tls_context.wrap_socket(raw_conn, server_side=True)
+        except ssl.SSLError as e:
+            log.warning(f"TLS handshake failed from {client_addr}: {e}")
+            raw_conn.close()
+            continue
+    else:
+        client_connection = raw_conn
+    threading.Thread(target=handle_client, args=(client_connection,), daemon=True).start()
