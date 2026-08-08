@@ -242,15 +242,3 @@ or `pip3 install --upgrade certifi`.
 ## Security design
 
 **Threat model.** Luneo assumes the server is untrusted for message content. A compromised server can observe who talks to whom and when, but cannot read messages, forge them, or replay them undetected.
-
-**What's protected**
-
-| Property | Mechanism |
-|||
-| Confidentiality | AES-256-GCM, key wrapped with recipient's RSA-4096 |
-| Integrity | GCM authentication tag |
-| Authenticity | RSA-PSS signature per message |
-| Session identity | Challenge–response at login, bound to the connection |
-| Replay resistance | Per-message UUID, checked and recorded by the recipient |
-| Path traversal | Whitelist validation on usernames and filenames, both sides |
-| Metadata (with TLS) | TLS 1.2+ transport encryption |
