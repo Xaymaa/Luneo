@@ -34,7 +34,7 @@ VALID_USERNAME = re.compile(r"^[a-z0-9_-]{2,32}$")
 def valid_username(name):
     return isinstance(name, str) and bool(VALID_USERNAME.match(name))
 
-def send_msg(msg_code,client_connection,*,username="",recipient="",pending_author="",msg="",code=0,isRegistered="",pubkey=""):
+def send_msg(msg_code,client_connection,*,username="",recipient="",msg="",code=0,isRegistered="",pubkey=""):
   if msg_code==20:
     formatted_msg={
         "type":{"code":20, "description":"Server Info"},
@@ -58,7 +58,6 @@ def send_msg(msg_code,client_connection,*,username="",recipient="",pending_autho
   elif msg_code==22:
     formatted_msg={
       "type":{"code":22, "description":"Pending Messages Response"},
-      "pending_author":pending_author,
       "pending messages":msg
     }
   elif msg_code==23:
@@ -89,15 +88,16 @@ def send_msg(msg_code,client_connection,*,username="",recipient="",pending_autho
     }
   send_framed(client_connection,formatted_msg)
 
-def deliver_pending_messages(client_connection, username, pending_author):
+def deliver_pending_messages(client_connection, username):
     pending_dir = f"user_data/{username}/pending"
-    path = f"{pending_dir}/pending_{pending_author}.json"
-    if os.path.isfile(path):
-        log.info(f"delivering the pending messages of user : {username}")
-        with open(path, "r") as m:
-            message = json.load(m)
-        send_msg(22, client_connection, msg=message, pending_author=pending_author)
-        os.remove(path)
+    for pending_msg in os.listdir(pending_dir):
+      path = f"{pending_dir}/{pending_msg}"
+      if os.path.isfile(path):
+          log.info(f"delivering the pending messages of user : {username}")
+          with open(path, "r") as m:
+              message = json.load(m)
+          send_msg(22, client_connection, msg=message)
+          os.remove(path)
 
 def authenticate(client_connection,username,isRegistered,pubkey):
   if isRegistered==False:
@@ -206,8 +206,7 @@ def handle_messages(client_connection, data, session_username):
       else:
           send_framed(recipient_conn, data) 
   elif msg_code==11:
-    pending_author=data["pending_author"]
-    deliver_pending_messages(client_connection,username,pending_author)
+    deliver_pending_messages(client_connection,username)
   elif msg_code==14:
     if not valid_username(data["recipient"]):
       send_msg(20, client_connection, code=2, msg="Invalid username.")
@@ -223,6 +222,11 @@ def handle_messages(client_connection, data, session_username):
           send_msg(26,client_connection,username=username,recipient=recipient,pubkey=pubkey)
     except FileNotFoundError:
       send_msg(20,client_connection,msg=f"The user {recipient} does not exist.")
+  elif msg_code==15:
+    if not valid_username(data["username"]):
+      send_msg(20, client_connection, code=2, msg="Invalid username.")
+      return
+    send_msg(21,client_connection,username=data["username"])
   else:
     log.warning(f"Unknown code sent from user : {username}")
     client_connection.close()
@@ -259,7 +263,6 @@ def handle_client(client_connection):
             return
         with clients_lock:
             connected_clients[username] = client_connection
-        send_msg(21, client_connection, username=username)
         #Normal traffic after auth
         while True:
             data = recv_framed(client_connection)
