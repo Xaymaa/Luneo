@@ -20,6 +20,8 @@ from protocol import send_framed,recv_framed
 
 HOME = Path.home()
 LUNEO_DIR = HOME / ".luneo"
+MAX_FILE_SIZE=100*1024*1024
+
 log.basicConfig(level=log.INFO, format='[%(levelname)s] | %(asctime)s | %(message)s')
 s_connect = s.socket(s.AF_INET, s.SOCK_STREAM)
 hostname="0.0.0.0"
@@ -48,6 +50,9 @@ VALID_USERNAME = re.compile(r"^[a-z0-9_-]{2,32}$")
 def valid_username(name):
     return isinstance(name, str) and bool(VALID_USERNAME.match(name))
 
+def valid_filename(name):
+    return  ("/" not in name) and ("\\" not in name) and (name!="..")
+
 def generate_keys(username):
   user_dir=f"{LUNEO_DIR}/{username}"
   os.makedirs(user_dir)
@@ -72,7 +77,10 @@ def encrypt(plaintext,username,recipient):
   plain_key=secrets.token_bytes(32)
   iv=secrets.token_bytes(12)
   encryptor=Cipher(algorithms.AES(plain_key),modes.GCM(iv),).encryptor()
-  ciphertext=encryptor.update(plaintext.encode("utf-8")) + encryptor.finalize() 
+  if type(plaintext)==str:
+    ciphertext=encryptor.update(plaintext.encode("utf-8")) + encryptor.finalize() 
+  else:
+    ciphertext=encryptor.update(plaintext) + encryptor.finalize() 
   with open(f"{LUNEO_DIR}/{username}/contacts/{recipient}/{recipient}.pub", "rb") as key_file:
           pubkey = serialization.load_pem_public_key(
               key_file.read()
@@ -109,7 +117,7 @@ def decrypt(iv,ciphertext,encrypted_key,tag,username):
         algorithms.AES(plain_key),
         modes.GCM(iv, tag),
     ).decryptor()
-  return (decryptor.update(ciphertext) + decryptor.finalize()).decode("utf-8")
+  return (decryptor.update(ciphertext) + decryptor.finalize())
   
 def sign(payload,username):
   with open(f"{LUNEO_DIR}/{username}/{username}.key", "rb") as key_file:
@@ -178,17 +186,32 @@ def record_uuid(uid, username):
         print(f"{e!r}")
 
 def print_pending_messages(username,recipient):
-  pending_path=f"{LUNEO_DIR}/{username}/contacts/{recipient}/pending/pending.txt"
-  if os.path.isfile(pending_path):
-    with open(pending_path,"r") as p:
-      messages=p.read().splitlines()
-    if messages!=[]:
-      print("New messages :")
-    for message in messages:
-      print(message)
-    os.remove(pending_path)
+  contact_dir=f"{LUNEO_DIR}/{username}/contacts/{recipient}"
+  pending_dir=f"{contact_dir}/pending"
+  pending_path=f"{pending_dir}/pending.txt"
+  if os.path.isdir(pending_dir):
+    if os.path.isfile(pending_path):
+      with open(pending_path,"r") as p:
+        messages=p.read().splitlines()
+      if messages!=[]:
+        print("New messages :")
+      for message in messages:
+        print(message)
+      os.remove(pending_path)
+    os.makedirs(f"{pending_dir}/image",exist_ok=True)
+    os.makedirs(f"{pending_dir}/video",exist_ok=True)
+    os.makedirs(f"{contact_dir}/image",exist_ok=True)
+    os.makedirs(f"{contact_dir}/video",exist_ok=True)
+    images=os.listdir(f"{pending_dir}/image")
+    videos=os.listdir(f"{pending_dir}/video")
+    for image in images:
+      shutil.move(f"{pending_dir}/image/{image}",f"{contact_dir}/image/{image}")
+      print(f"{recipient} sent you {image} in {contact_dir}/image")
+    for video in videos:
+      shutil.move(f"{pending_dir}/video/{video}",f"{contact_dir}/video/{video}")
+      print(f"{recipient} sent you {video} in {contact_dir}/video")
 
-def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",isRegistered=""):
+def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",isRegistered="",msg_format={}):
     if msg_code==10:
       iv,ciphertext,encrypted_key,tag=encrypt(msg,username,recipient)
       formatted_msg={
@@ -196,6 +219,7 @@ def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",i
         "username":username,
         "recipient":recipient,
         "ciphertext":ciphertext,
+        "format":msg_format,
         "iv":iv,
         "key":encrypted_key,
         "tag":tag,
@@ -231,7 +255,13 @@ def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",i
         "username":username
       }
     payload=json.dumps(formatted_msg).encode("utf-8")
-    send_framed(connection, sign(payload, username))
+    try:
+      send_framed(connection, sign(payload, username))
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        connection_lost.set()
+        authentication_try.set()
+        contact_selection.set()
+        print("Connection to server lost.")
 
 
 def handle_messages(connection):
@@ -266,15 +296,31 @@ def handle_messages(connection):
             send_msg(14, connection, username=recipient, recipient=sender)
             continue
         if verify_signature(data,sender,recipient=recipient):
-          message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"])
-          if in_conversation==sender:
-            print(f"{sender} : {message}")
-          else:
-            if not os.path.isdir(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending"):
-              os.makedirs(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending")
-            with open(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending/pending.txt","a") as p:
-                p.write(f"{sender} : {message}\n")
-
+          msg_format=data["format"]["format"]
+          if msg_format=="text":
+            message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"]).decode("utf-8")
+            if in_conversation==sender:
+              print(f"{sender} : {message}")
+            else:
+              if not os.path.isdir(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending"):
+                os.makedirs(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending")
+              with open(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending/pending.txt","a") as p:
+                  p.write(f"{sender} : {message}\n")
+          elif msg_format in ("image","video"):
+            message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"])
+            format_pending_dir=f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending/{msg_format}"
+            format_dir=f"{LUNEO_DIR}/{recipient}/contacts/{sender}/{msg_format}"
+            if not valid_filename(data["format"]["name"]) :
+              continue
+            os.makedirs(format_dir,exist_ok=True)
+            os.makedirs(format_pending_dir,exist_ok=True)
+            if in_conversation==sender:
+              with open(f"{format_dir}/{data["format"]["name"]}","wb") as f:
+                f.write(message)
+              print(f"{sender} sent you {data["format"]["name"]}, you can find it in {format_dir}")
+            else:
+              with open(f"{format_pending_dir}/{data["format"]["name"]}","wb") as f:
+                f.write(message)
           record_uuid(data["id"],recipient)
       elif msg_code==20:   
         print(f"received from server : {data["message"]}")
@@ -286,16 +332,22 @@ def handle_messages(connection):
           contact_path=f"{LUNEO_DIR}/{data["username"]}/contacts/"
           if os.path.isdir(contact_path):
             for contact in os.listdir(contact_path):
+              try:
+                image_count=len(os.listdir(f"{contact_path}/{contact}/pending/image"))
+                video_count=len(os.listdir(f"{contact_path}/{contact}/pending/video"))
+              except Exception:
+                image_count,video_count=0,0
               pending_path=f"{contact_path}/{contact}/pending/pending.txt"
-              if os.path.isfile(pending_path):
-                with open(pending_path,"r") as p:
-                  message_count=len(p.readlines())
-                if message_count==0:
-                  continue
+              if os.path.isfile(pending_path) or image_count>0 or video_count>0:
+                try:
+                  with open(pending_path,"r") as p:
+                    message_count=len(p.readlines())
+                except FileNotFoundError:
+                  message_count=0
                 if contact in pending_messages:
-                  pending_messages[contact]+=message_count
+                  pending_messages[contact]+=(message_count+image_count+video_count)
                 else:
-                  pending_messages[contact]=message_count
+                  pending_messages[contact]=(message_count+image_count+video_count)
               else:
                 continue
             if pending_messages=={}:
@@ -316,11 +368,21 @@ def handle_messages(connection):
               send_msg(14, connection, username=pending_msg["recipient"], recipient=pending_msg["username"])
               continue
           if verify_signature(pending_msg,pending_msg["username"],recipient=pending_msg["recipient"]):
-            message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"],pending_msg["recipient"])
-            spool_dir = f"{LUNEO_DIR}/{pending_msg['recipient']}/contacts/{pending_msg['username']}/pending"
-            os.makedirs(spool_dir, exist_ok=True)
-            with open(f"{spool_dir}/pending.txt", "a") as p:
-                p.write(f"{pending_msg['username']} : {message}\n")
+            msg_format=pending_msg["format"]["format"]
+            if msg_format=="text":
+              message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"],pending_msg["recipient"]).decode("utf-8")
+              spool_dir = f"{LUNEO_DIR}/{pending_msg['recipient']}/contacts/{pending_msg['username']}/pending"
+              os.makedirs(spool_dir, exist_ok=True)
+              with open(f"{spool_dir}/pending.txt", "a") as p:
+                  p.write(f"{pending_msg['username']} : {message}\n")
+            elif msg_format in ("image","video"):
+              message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"],pending_msg["recipient"])
+              format_pending_dir=f"{LUNEO_DIR}/{pending_msg['recipient']}/contacts/{pending_msg['username']}/pending/{msg_format}"
+              os.makedirs(format_pending_dir,exist_ok=True)
+              if not valid_filename(pending_msg["format"]["name"]) :
+                continue
+              with open(f"{format_pending_dir}/{pending_msg["format"]["name"]}","wb") as f:
+                f.write(message)
             record_uuid(pending_msg["id"], pending_msg["recipient"])
       elif msg_code==23:
         print(f"Authentication Successful")
@@ -397,19 +459,38 @@ def handle_messages(connection):
           if not is_uuid_unique(held["id"]):
             continue
           if verify_signature(held, held["username"], recipient=held["recipient"]):
-              plaintext=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"])
-              if in_conversation==held["username"]:
-                print(f"{held['username']} : {plaintext}")
-              else:
-                if not os.path.isdir(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending"):
-                  os.makedirs(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending")
-                with open(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending/pending.txt","a") as p:
-                  p.write(f"{held['username']} : {plaintext}\n")
+              msg_format=held["format"]["format"]
+              if msg_format=="text":
+                message=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"]).decode("utf-8")
+                if in_conversation==held["username"]:
+                  print(f"{held['username']} : {message}")
+                else:
+                  if not os.path.isdir(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending"):
+                    os.makedirs(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending")
+                  with open(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending/pending.txt","a") as p:
+                    p.write(f"{held['username']} : {message}\n")
+              elif msg_format in ("image","video"):
+                message=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"])
+                format_pending_dir=f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held['username']}/pending/{msg_format}"
+                format_dir=f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held['username']}/{msg_format}"
+                if not valid_filename(held["format"]["name"]) :
+                  continue
+                os.makedirs(format_dir,exist_ok=True)
+                os.makedirs(format_pending_dir,exist_ok=True)
+                if in_conversation==held['username']:
+                  with open(f"{format_dir}/{held["format"]["name"]}","wb") as f:
+                    f.write(message)
+                  print(f"{held['username']} sent you {held["format"]["name"]}, you can find it in {format_dir}")
+                else:
+                  with open(f"{format_pending_dir}/{held["format"]["name"]}","wb") as f:
+                    f.write(message)
               record_uuid(held["id"],held["recipient"])
         if awaiting_contact==recipient:
           contact_selection.set()
     except Exception as e:
-      print(f"error handling message: {e!r}")
+      #print(f"error handling message: {e!r}")
+      import traceback
+      traceback.print_exc()
 
 if not os.path.isdir(f"{LUNEO_DIR}"):
   os.makedirs(f"{LUNEO_DIR}")
@@ -490,15 +571,50 @@ with patch_stdout():
       continue
     if contact_selected:
       in_conversation=recipient
-      log.info("Send '/c' to change contact")
+      print("Send '/c' to change contact")
+      print("Send '/v:path/to/file' to send a video and '/i:path/to/file' to send an image")
       print_pending_messages(username,recipient)
       while True:
         msg=prompt(">")
         if msg =="":
-          log.info("No message was sent")
+          print("No message was sent")
           continue
         elif msg=="/c":
           break
         elif msg=="/q":
           sys.exit(1)
-        send_msg(10,s_connect,username=username,recipient=recipient,msg=msg)
+        elif msg[:3]=="/i:":
+          msg=msg.removeprefix("/i:")
+          file_extension=msg.split(".")[-1]
+          if file_extension not in ("jpg","png","jpeg"):
+            print("The file format should be jpg, jpeg or png.")
+            continue
+          try:
+            if os.path.getsize(msg) > MAX_FILE_SIZE:
+              print("Maximum file size : 100MB")
+              continue
+            with open(msg,"rb") as i:
+              image=i.read()
+          except FileNotFoundError:
+            print("This file does not exist.")
+            continue
+          send_msg(10,s_connect,username=username,recipient=recipient,msg=image,msg_format={"format":"image","name":msg.split("/")[-1],"extension":file_extension})
+          continue
+        elif msg[:3]=="/v:":
+          msg=msg.removeprefix("/v:")
+          file_extension=msg.split(".")[-1]
+          if file_extension not in ("mp4","mov","gif"):
+            print("The file format should be mp4, mov or gif.")
+            continue
+          try:
+            if os.path.getsize(msg) > MAX_FILE_SIZE:
+              print("Maximum file size : 100MB")
+              continue
+            with open(msg,"rb") as v:
+              video=v.read()
+          except FileNotFoundError:
+            print("This file does not exist.")
+            continue
+          send_msg(10,s_connect,username=username,recipient=recipient,msg=video,msg_format={"format":"video","name":msg.split("/")[-1],"extension":file_extension})
+          continue
+        send_msg(10,s_connect,username=username,recipient=recipient,msg=msg,msg_format={"format":"text"})
