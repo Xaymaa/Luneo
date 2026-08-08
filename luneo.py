@@ -19,8 +19,9 @@ if not os.path.isdir('user_data'):
 
 #Ouverture du serveur sur le port 9941
 log.info("Launching the Luneo server...")
-s_listen = s.socket(s.AF_INET, s.SOCK_STREAM)
 port=9941
+s_listen = s.socket(s.AF_INET, s.SOCK_STREAM)
+s_listen.setsockopt(s.SOL_SOCKET, s.SO_REUSEADDR, 1)
 s_listen.bind(('0.0.0.0',port))
 log.info("Server launched successfully !")
 
