@@ -21,7 +21,6 @@ from protocol import send_framed,recv_framed
 HOME = Path.home()
 log.basicConfig(level=log.INFO, format='[%(levelname)s] | %(asctime)s | %(message)s')
 s_connect = s.socket(s.AF_INET, s.SOCK_STREAM)
-#hostname="87.106.192.17"
 hostname="0.0.0.0"
 host_port=9941
 
