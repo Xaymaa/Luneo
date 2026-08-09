@@ -48,6 +48,8 @@ in_conversation=""
 auth_failed_reason = None
 awaiting_contact = None
 username = None
+passphrase=None
+private_key=None
 
 known_ids=set()
 
@@ -68,10 +70,18 @@ def generate_keys(username):
     public_exponent=65537,
     key_size=4096,
   )
+  while True:
+    passphrase=prompt("Choose a passphrase for your new private key :",is_password=True)
+    confirmation_passphrase=prompt("Confirm by retyping the same one :",is_password=True)
+    if passphrase!=confirmation_passphrase:
+      print("The two passphrases are different")
+      continue
+    else:
+      break
   privkey=private_key.private_bytes(
    encoding=serialization.Encoding.PEM,
-   format=serialization.PrivateFormat.TraditionalOpenSSL,
-   encryption_algorithm=serialization.NoEncryption()
+   format=serialization.PrivateFormat.PKCS8,
+   encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode())
   )
   pubkey=private_key.public_key().public_bytes(encoding=serialization.Encoding.PEM,
     format=serialization.PublicFormat.SubjectPublicKeyInfo)
@@ -79,7 +89,7 @@ def generate_keys(username):
     privkey_file.write(privkey)
   with open(f"{user_dir}/{username}.pub","wb") as pubkey_file:
     pubkey_file.write(pubkey)
-  return private_key,pubkey
+  return private_key,pubkey,passphrase
 
 def encrypt(plaintext,username,recipient):
   plain_key=secrets.token_bytes(32)
@@ -105,17 +115,12 @@ def encrypt(plaintext,username,recipient):
   tag=base64.b64encode(encryptor.tag).decode()
   return iv,ciphertext,encrypted_key,tag
 
-def decrypt(iv,ciphertext,encrypted_key,tag,username):
+def decrypt(iv,ciphertext,encrypted_key,tag):
   iv=base64.b64decode(iv)
   ciphertext=base64.b64decode(ciphertext)
   encrypted_key=base64.b64decode(encrypted_key)
   tag=base64.b64decode(tag)
-  with open(f"{LUNEO_DIR}/{username}/{username}.key", "rb") as key_file:
-    privkey = serialization.load_pem_private_key(
-    key_file.read(),
-    password=None,
-    ) 
-  plain_key = privkey.decrypt(
+  plain_key = private_key.decrypt(
   encrypted_key,
   padding.OAEP(
       mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -127,13 +132,9 @@ def decrypt(iv,ciphertext,encrypted_key,tag,username):
     ).decryptor()
   return (decryptor.update(ciphertext) + decryptor.finalize())
   
-def sign(payload,username):
-  with open(f"{LUNEO_DIR}/{username}/{username}.key", "rb") as key_file:
-    privkey = serialization.load_pem_private_key(
-    key_file.read(),
-    password=None,
-    ) 
-  signature = privkey.sign(
+def sign(payload):
+  global private_key
+  signature = private_key.sign(
     payload,
     padding.PSS(
         mgf=padding.MGF1(hashes.SHA256()),
@@ -264,7 +265,7 @@ def send_msg(msg_code,connection,username="",*, recipient="", msg="",pubkey="",i
       }
     payload=json.dumps(formatted_msg).encode("utf-8")
     try:
-      send_framed(connection, sign(payload, username))
+      send_framed(connection, sign(payload))
     except (BrokenPipeError, ConnectionResetError, OSError):
         connection_lost.set()
         authentication_try.set()
@@ -306,7 +307,7 @@ def handle_messages(connection):
         if verify_signature(data,sender,recipient=recipient):
           msg_format=data["format"]["format"]
           if msg_format=="text":
-            message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"]).decode("utf-8")
+            message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"]).decode("utf-8")
             if in_conversation==sender:
               print(f"{sender} : {message}")
             else:
@@ -315,7 +316,7 @@ def handle_messages(connection):
               with open(f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending/pending.txt","a") as p:
                   p.write(f"{sender} : {message}\n")
           elif msg_format in ("image","video"):
-            message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"],data["recipient"])
+            message=decrypt(data["iv"],data["ciphertext"],data["key"],data["tag"])
             format_pending_dir=f"{LUNEO_DIR}/{recipient}/contacts/{sender}/pending/{msg_format}"
             format_dir=f"{LUNEO_DIR}/{recipient}/contacts/{sender}/{msg_format}"
             if not valid_filename(data["format"]["name"]) :
@@ -378,13 +379,13 @@ def handle_messages(connection):
           if verify_signature(pending_msg,pending_msg["username"],recipient=pending_msg["recipient"]):
             msg_format=pending_msg["format"]["format"]
             if msg_format=="text":
-              message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"],pending_msg["recipient"]).decode("utf-8")
+              message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"]).decode("utf-8")
               spool_dir = f"{LUNEO_DIR}/{pending_msg['recipient']}/contacts/{pending_msg['username']}/pending"
               os.makedirs(spool_dir, exist_ok=True)
               with open(f"{spool_dir}/pending.txt", "a") as p:
                   p.write(f"{pending_msg['username']} : {message}\n")
             elif msg_format in ("image","video"):
-              message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"],pending_msg["recipient"])
+              message=decrypt(pending_msg["iv"],pending_msg["ciphertext"],pending_msg["key"],pending_msg["tag"])
               format_pending_dir=f"{LUNEO_DIR}/{pending_msg['recipient']}/contacts/{pending_msg['username']}/pending/{msg_format}"
               os.makedirs(format_pending_dir,exist_ok=True)
               if not valid_filename(pending_msg["format"]["name"]) :
@@ -420,20 +421,8 @@ def handle_messages(connection):
           continue
         challengee=data["username"]
         ciphertext=base64.b64decode(data["challenge_phrase"])
-        try:
-          with open(f"{LUNEO_DIR}/{challengee}/{challengee}.key", "rb") as key_file:
-            privkey = serialization.load_pem_private_key(
-            key_file.read(),
-            password=None,
-            ) 
-        except FileNotFoundError:
-          print(f"You have no key for user {challengee}")
-          connection_lost.set()
-          authentication_try.set()
-          contact_selection.set()
-          return
         try :
-          plaintext = privkey.decrypt(
+          plaintext = private_key.decrypt(
           ciphertext,
           padding.OAEP(
               mgf=padding.MGF1(algorithm=hashes.SHA256()),
@@ -469,7 +458,7 @@ def handle_messages(connection):
           if verify_signature(held, held["username"], recipient=held["recipient"]):
               msg_format=held["format"]["format"]
               if msg_format=="text":
-                message=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"]).decode("utf-8")
+                message=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"]).decode("utf-8")
                 if in_conversation==held["username"]:
                   print(f"{held['username']} : {message}")
                 else:
@@ -478,7 +467,7 @@ def handle_messages(connection):
                   with open(f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held["username"]}/pending/pending.txt","a") as p:
                     p.write(f"{held['username']} : {message}\n")
               elif msg_format in ("image","video"):
-                message=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"],held["recipient"])
+                message=decrypt(held["iv"],held["ciphertext"],held["key"],held["tag"])
                 format_pending_dir=f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held['username']}/pending/{msg_format}"
                 format_dir=f"{LUNEO_DIR}/{held["recipient"]}/contacts/{held['username']}/{msg_format}"
                 if not valid_filename(held["format"]["name"]) :
@@ -550,8 +539,9 @@ while True:
     isRegistered=True
   break
 
+
 if isRegistered==False:
-  private_key,pubkey=generate_keys(username)
+  private_key,pubkey,passphrase=generate_keys(username)
   send_msg(12,s_connect,username=username,pubkey=pubkey,isRegistered=False)
 else:
   try:
@@ -565,7 +555,47 @@ else:
     sys.exit(1)
   pubkey=pubkey.public_bytes(encoding=serialization.Encoding.PEM,
   format=serialization.PublicFormat.SubjectPublicKeyInfo)
+  try:
+    with open(f"{user_dir}/{username}.key", "rb") as key_file:
+      privkey = key_file.read()
+    try:
+      serialization.load_pem_private_key(privkey, password=None)
+      needs_migration = True
+    except TypeError:
+        needs_migration = False  
+    if needs_migration: 
+      while True:
+        passphrase=prompt("Choose a passphrase for your private key :",is_password=True)
+        confirmation_passphrase=prompt("Confirm by retyping the same one :",is_password=True)
+        if passphrase!=confirmation_passphrase:
+          print("The two passphrases are different")
+          continue
+        else:
+          break
+      with open(f"{user_dir}/{username}.key", "rb") as key_file:
+        privkey = serialization.load_pem_private_key(key_file.read(), password=None)
+      privbytes=privkey.private_bytes(encoding=serialization.Encoding.PEM,
+      format=serialization.PrivateFormat.PKCS8,
+      encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode())
+      )
+      with open(f"{user_dir}/{username}.key", "wb") as key_file:
+        key_file.write(privbytes)
+    else:
+      passphrase=prompt("Enter your passphrase : ",is_password=True)
+  except FileNotFoundError:
+    print(f"You have no key for user {username}")
+    s_connect.close()
+    sys.exit(1)
+  while True:
+    try:
+        with open(f"{user_dir}/{username}.key", "rb") as f:
+            private_key = serialization.load_pem_private_key(f.read(), password=passphrase.encode())
+        break
+    except ValueError:
+        print("Invalid passphrase.")
+        passphrase = prompt("Enter your passphrase : ", is_password=True)
   send_msg(12,s_connect,username=username,pubkey=pubkey,isRegistered=True)
+
 
 authentication_try.wait()
 if connection_lost.is_set():
